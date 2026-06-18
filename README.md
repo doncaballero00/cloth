@@ -56,14 +56,27 @@ export ELEVENLABS_API_KEY=your_key_here
 ```
 Default voice: Rachel. Pass any ElevenLabs voice ID as the `voice` parameter.
 
-**Option C — System TTS** (free, robotic):
+**Option C — Local neural voice** (free AND natural, fully offline):
+```bash
+# Downloads a Piper neural voice (~110 MB) and installs the runtime
+bash scripts/setup_neural_voice.sh
+export PODCAST_VOICE_DIR=$HOME/.local/share/podcast-voices/vits-piper-en_US-ryan-high
+```
+Runs entirely on your machine via `sherpa-onnx` — no API key, nothing leaves
+your computer. Voices sound natural (far better than espeak). Swap voices by
+passing another name to the setup script, e.g.
+`bash scripts/setup_neural_voice.sh vits-piper-en_US-amy-medium`.
+
+**Option D — System TTS** (free, robotic fallback):
 ```bash
 # Ubuntu/Debian
 sudo apt-get install espeak-ng
 # macOS uses built-in `say` automatically
 ```
 
-The plugin auto-selects the best available provider based on which env var is set.
+The plugin auto-selects the best available provider: OpenAI → ElevenLabs →
+local neural → system, based on which env vars are set. Override per-call with
+the `provider` / `tts_provider` parameter.
 
 ## Usage Examples
 

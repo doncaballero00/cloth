@@ -66,7 +66,7 @@ const TEXT_TO_SPEECH_TOOL: Tool = {
       },
       provider: {
         type: "string",
-        enum: ["openai", "elevenlabs", "system"],
+        enum: ["openai", "elevenlabs", "local", "system"],
         description: "TTS provider: 'openai' (natural, set OPENAI_API_KEY), 'elevenlabs' (most realistic, set ELEVENLABS_API_KEY), 'system' (free espeak-ng fallback). Auto-detects from available env vars if omitted.",
       },
       voice: {
@@ -117,7 +117,7 @@ const CREATE_PODCAST_TOOL: Tool = {
       },
       tts_provider: {
         type: "string",
-        enum: ["openai", "elevenlabs", "system"],
+        enum: ["openai", "elevenlabs", "local", "system"],
         description: "TTS provider for audio generation (auto-detects from env vars if omitted)",
       },
       voice: {
@@ -245,7 +245,37 @@ function detectTtsProvider(requested?: string): string {
   if (requested) return requested;
   if (process.env.OPENAI_API_KEY) return "openai";
   if (process.env.ELEVENLABS_API_KEY) return "elevenlabs";
+  if (process.env.PODCAST_VOICE_DIR) return "local";
   return "system";
+}
+
+async function ttsLocalNeural(params: {
+  text: string;
+  output_file: string;
+  voice?: string;
+}): Promise<string> {
+  const voiceDir = params.voice ?? process.env.PODCAST_VOICE_DIR;
+  if (!voiceDir) {
+    throw new Error(
+      "Local neural TTS needs a voice model. Run scripts/setup_neural_voice.sh and set PODCAST_VOICE_DIR (or pass the model dir as 'voice')."
+    );
+  }
+
+  const { exec } = await import("child_process");
+  const { promisify } = await import("util");
+  const execAsync = promisify(exec);
+
+  const wavFile = params.output_file.replace(/\.[^.]+$/, ".wav");
+  const tempTextFile = "/tmp/podcast_neural_input.txt";
+  fs.writeFileSync(tempTextFile, params.text, "utf-8");
+
+  // scripts/neural_tts.py lives alongside the built dist/ dir
+  const scriptPath = path.join(__dirname, "..", "scripts", "neural_tts.py");
+
+  const cmd = `python3 "${scriptPath}" --text-file "${tempTextFile}" --out "${wavFile}" --model-dir "${voiceDir}" --speed 0.96`;
+  const { stdout } = await execAsync(cmd, { maxBuffer: 1024 * 1024 * 16 });
+
+  return `Audio generated with local neural TTS (Piper/sherpa-onnx — natural voice, fully offline).\nFile: ${path.resolve(wavFile)}\n${stdout.trim()}`;
 }
 
 async function ttsOpenAI(params: {
@@ -459,6 +489,8 @@ async function textToSpeech(params: {
     return ttsOpenAI({ text: params.text, output_file: outputFile, voice: params.voice });
   } else if (provider === "elevenlabs") {
     return ttsElevenLabs({ text: params.text, output_file: outputFile, voice: params.voice });
+  } else if (provider === "local") {
+    return ttsLocalNeural({ text: params.text, output_file: outputFile, voice: params.voice });
   } else {
     return ttsSystem({ text: params.text, output_file: outputFile, voice: params.voice });
   }
