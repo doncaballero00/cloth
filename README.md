@@ -42,14 +42,28 @@ export ANTHROPIC_API_KEY=your_key_here
 }
 ```
 
-### 4. Optional: Install TTS for audio generation
+### 4. TTS for audio generation (pick one)
 
+**Option A — OpenAI TTS** (natural, ~$0.03 for a 10-min episode):
+```bash
+export OPENAI_API_KEY=sk-...
+```
+Voices: `nova` (default), `alloy`, `echo`, `fable`, `onyx`, `shimmer`
+
+**Option B — ElevenLabs** (most realistic, free tier = 10k chars/month):
+```bash
+export ELEVENLABS_API_KEY=your_key_here
+```
+Default voice: Rachel. Pass any ElevenLabs voice ID as the `voice` parameter.
+
+**Option C — System TTS** (free, robotic):
 ```bash
 # Ubuntu/Debian
 sudo apt-get install espeak-ng
-
-# macOS (built-in `say` is used automatically)
+# macOS uses built-in `say` automatically
 ```
+
+The plugin auto-selects the best available provider based on which env var is set.
 
 ## Usage Examples
 
@@ -60,19 +74,44 @@ Once installed in Claude Code, you can say:
 - *"Make a podcast about quantum computing in an educational style for high school students"*
 - *"Create a full podcast about space exploration and generate audio output"*
 
-## Example Tool Call
+## Example Tool Calls
 
+Generate a script only:
 ```json
 {
-  "tool": "create_podcast",
+  "tool": "generate_podcast_script",
   "arguments": {
     "topic": "The history of jazz music",
     "duration_minutes": 15,
     "hosts": ["Sarah", "Mike"],
-    "style": "conversational",
-    "target_audience": "music enthusiasts",
+    "style": "conversational"
+  }
+}
+```
+
+Convert existing text to natural audio (OpenAI):
+```json
+{
+  "tool": "text_to_speech",
+  "arguments": {
+    "text": "Welcome to the show...",
+    "provider": "openai",
+    "voice": "nova",
+    "output_file": "episode.mp3"
+  }
+}
+```
+
+All-in-one with ElevenLabs audio:
+```json
+{
+  "tool": "create_podcast",
+  "arguments": {
+    "topic": "Quantum computing for beginners",
+    "duration_minutes": 10,
     "generate_audio": true,
-    "output_file": "jazz_history.wav"
+    "tts_provider": "elevenlabs",
+    "output_file": "quantum.mp3"
   }
 }
 ```

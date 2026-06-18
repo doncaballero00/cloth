@@ -52,7 +52,7 @@ const GENERATE_SCRIPT_TOOL: Tool = {
 const TEXT_TO_SPEECH_TOOL: Tool = {
   name: "text_to_speech",
   description:
-    "Convert podcast script text to speech audio using the system's built-in TTS. Saves audio to a file.",
+    "Convert podcast script text to speech audio. Supports OpenAI TTS (natural, requires OPENAI_API_KEY), ElevenLabs (most realistic, requires ELEVENLABS_API_KEY), or system espeak-ng as fallback.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -62,12 +62,16 @@ const TEXT_TO_SPEECH_TOOL: Tool = {
       },
       output_file: {
         type: "string",
-        description:
-          "Output file path for the audio (default: podcast_output.mp3)",
+        description: "Output file path for the audio (default: podcast_output.mp3)",
+      },
+      provider: {
+        type: "string",
+        enum: ["openai", "elevenlabs", "system"],
+        description: "TTS provider: 'openai' (natural, set OPENAI_API_KEY), 'elevenlabs' (most realistic, set ELEVENLABS_API_KEY), 'system' (free espeak-ng fallback). Auto-detects from available env vars if omitted.",
       },
       voice: {
         type: "string",
-        description: "Voice to use for TTS (system-dependent)",
+        description: "Voice name. OpenAI: alloy, echo, fable, onyx, nova, shimmer (default: nova). ElevenLabs: voice ID or name (default: Rachel). System: en-us, en-gb, etc.",
       },
     },
     required: ["text"],
@@ -110,6 +114,15 @@ const CREATE_PODCAST_TOOL: Tool = {
       output_file: {
         type: "string",
         description: "Output file path if generating audio",
+      },
+      tts_provider: {
+        type: "string",
+        enum: ["openai", "elevenlabs", "system"],
+        description: "TTS provider for audio generation (auto-detects from env vars if omitted)",
+      },
+      voice: {
+        type: "string",
+        description: "Voice name/ID for TTS (see text_to_speech tool for options)",
       },
     },
     required: ["topic"],
@@ -228,66 +241,226 @@ Be specific and actionable, not generic.`;
   return textContent ? textContent.text : "Failed to generate outline";
 }
 
-async function textToSpeech(params: {
+function detectTtsProvider(requested?: string): string {
+  if (requested) return requested;
+  if (process.env.OPENAI_API_KEY) return "openai";
+  if (process.env.ELEVENLABS_API_KEY) return "elevenlabs";
+  return "system";
+}
+
+async function ttsOpenAI(params: {
   text: string;
-  output_file?: string;
+  output_file: string;
   voice?: string;
 }): Promise<string> {
-  const outputFile = params.output_file ?? "podcast_output.wav";
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set");
 
-  // Try espeak-ng first (most common on Linux)
+  const voice = (params.voice ?? "nova") as "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
+  const validVoices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+  if (!validVoices.includes(voice)) {
+    throw new Error(`Invalid OpenAI voice. Choose from: ${validVoices.join(", ")}`);
+  }
+
+  const https = await import("https");
+  const outputFile = params.output_file.endsWith(".mp3")
+    ? params.output_file
+    : params.output_file.replace(/\.[^.]+$/, "") + ".mp3";
+
+  // OpenAI TTS supports up to 4096 chars per request — chunk for long scripts
+  const CHUNK_SIZE = 4000;
+  const chunks: string[] = [];
+  let remaining = params.text;
+  while (remaining.length > 0) {
+    if (remaining.length <= CHUNK_SIZE) {
+      chunks.push(remaining);
+      break;
+    }
+    // Break at sentence boundary
+    const slice = remaining.slice(0, CHUNK_SIZE);
+    const lastPeriod = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf(".\n"));
+    const breakAt = lastPeriod > CHUNK_SIZE * 0.5 ? lastPeriod + 1 : CHUNK_SIZE;
+    chunks.push(remaining.slice(0, breakAt).trim());
+    remaining = remaining.slice(breakAt).trim();
+  }
+
+  const buffers: Buffer[] = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const body = JSON.stringify({ model: "tts-1-hd", input: chunk, voice });
+
+    const chunkBuf = await new Promise<Buffer>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: "api.openai.com",
+          path: "/v1/audio/speech",
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          if (res.statusCode !== 200) {
+            let errBody = "";
+            res.on("data", (d) => (errBody += d));
+            res.on("end", () => reject(new Error(`OpenAI TTS error ${res.statusCode}: ${errBody}`)));
+            return;
+          }
+          const parts: Buffer[] = [];
+          res.on("data", (d) => parts.push(d));
+          res.on("end", () => resolve(Buffer.concat(parts)));
+        }
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+
+    buffers.push(chunkBuf);
+  }
+
+  // Concatenate all MP3 chunks (MP3 frames are self-contained, simple concat works)
+  fs.writeFileSync(outputFile, Buffer.concat(buffers));
+  const sizeMB = (fs.statSync(outputFile).size / 1024 / 1024).toFixed(1);
+  return `Audio generated with OpenAI TTS!\nVoice: ${voice} (tts-1-hd)\nChunks: ${chunks.length}\nFile: ${path.resolve(outputFile)} (${sizeMB} MB)`;
+}
+
+async function ttsElevenLabs(params: {
+  text: string;
+  output_file: string;
+  voice?: string;
+}): Promise<string> {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) throw new Error("ELEVENLABS_API_KEY environment variable not set");
+
+  // Rachel (21m00Tcm4TlvDq8ikWAM) — warm, clear, natural female voice; free-tier friendly
+  const voiceId = params.voice ?? "21m00Tcm4TlvDq8ikWAM";
+  const outputFile = params.output_file.endsWith(".mp3")
+    ? params.output_file
+    : params.output_file.replace(/\.[^.]+$/, "") + ".mp3";
+
+  const https = await import("https");
+
+  // ElevenLabs supports up to ~5000 chars per request
+  const CHUNK_SIZE = 4500;
+  const chunks: string[] = [];
+  let remaining = params.text;
+  while (remaining.length > 0) {
+    if (remaining.length <= CHUNK_SIZE) {
+      chunks.push(remaining);
+      break;
+    }
+    const slice = remaining.slice(0, CHUNK_SIZE);
+    const lastPeriod = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf(".\n"));
+    const breakAt = lastPeriod > CHUNK_SIZE * 0.5 ? lastPeriod + 1 : CHUNK_SIZE;
+    chunks.push(remaining.slice(0, breakAt).trim());
+    remaining = remaining.slice(breakAt).trim();
+  }
+
+  const buffers: Buffer[] = [];
+
+  for (const chunk of chunks) {
+    const body = JSON.stringify({
+      text: chunk,
+      model_id: "eleven_turbo_v2_5",
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    });
+
+    const chunkBuf = await new Promise<Buffer>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: "api.elevenlabs.io",
+          path: `/v1/text-to-speech/${voiceId}`,
+          method: "POST",
+          headers: {
+            "xi-api-key": apiKey,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            Accept: "audio/mpeg",
+          },
+        },
+        (res) => {
+          if (res.statusCode !== 200) {
+            let errBody = "";
+            res.on("data", (d) => (errBody += d));
+            res.on("end", () => reject(new Error(`ElevenLabs error ${res.statusCode}: ${errBody}`)));
+            return;
+          }
+          const parts: Buffer[] = [];
+          res.on("data", (d) => parts.push(d));
+          res.on("end", () => resolve(Buffer.concat(parts)));
+        }
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+
+    buffers.push(chunkBuf);
+  }
+
+  fs.writeFileSync(outputFile, Buffer.concat(buffers));
+  const sizeMB = (fs.statSync(outputFile).size / 1024 / 1024).toFixed(1);
+  return `Audio generated with ElevenLabs!\nVoice ID: ${voiceId} (eleven_turbo_v2_5)\nChunks: ${chunks.length}\nFile: ${path.resolve(outputFile)} (${sizeMB} MB)`;
+}
+
+async function ttsSystem(params: {
+  text: string;
+  output_file: string;
+  voice?: string;
+}): Promise<string> {
   const { exec } = await import("child_process");
   const { promisify } = await import("util");
   const execAsync = promisify(exec);
 
-  // Check what TTS tools are available
   const ttsTools = ["espeak-ng", "espeak", "say", "festival"];
   let availableTool: string | null = null;
-
   for (const tool of ttsTools) {
-    try {
-      await execAsync(`which ${tool}`);
-      availableTool = tool;
-      break;
-    } catch {
-      continue;
-    }
+    try { await execAsync(`which ${tool}`); availableTool = tool; break; }
+    catch { continue; }
   }
 
   if (!availableTool) {
-    // Save as plain text file if no TTS available
-    const textFile = outputFile.replace(/\.(mp3|wav|ogg)$/, ".txt");
+    const textFile = params.output_file.replace(/\.(mp3|wav|ogg)$/, ".txt");
     fs.writeFileSync(textFile, params.text, "utf-8");
-    return `No TTS engine found on system. Script saved as text to: ${path.resolve(textFile)}\n\nTo enable audio generation, install espeak-ng: sudo apt-get install espeak-ng`;
+    return `No TTS engine found. Script saved as text to: ${path.resolve(textFile)}\nInstall espeak-ng: sudo apt-get install espeak-ng`;
   }
 
-  // Truncate text for audio preview (full scripts can be very long)
-  const textForAudio = params.text.slice(0, 5000);
   const tempTextFile = "/tmp/podcast_tts_input.txt";
-  fs.writeFileSync(tempTextFile, textForAudio, "utf-8");
-
-  const wavFile = outputFile.endsWith(".wav") ? outputFile : outputFile.replace(/\.[^.]+$/, ".wav");
+  fs.writeFileSync(tempTextFile, params.text, "utf-8");
+  const wavFile = params.output_file.replace(/\.[^.]+$/, ".wav");
 
   let command: string;
   if (availableTool === "espeak-ng" || availableTool === "espeak") {
-    const voice = params.voice ?? "en";
-    command = `${availableTool} -v ${voice} -s 150 -f "${tempTextFile}" -w "${wavFile}"`;
+    command = `${availableTool} -v ${params.voice ?? "en-us"} -s 150 -f "${tempTextFile}" -w "${wavFile}"`;
   } else if (availableTool === "say") {
-    // macOS
-    const voice = params.voice ?? "Alex";
-    command = `say -v ${voice} -o "${wavFile}" --data-format=LEF32@22050 -f "${tempTextFile}"`;
+    command = `say -v ${params.voice ?? "Alex"} -o "${wavFile}" --data-format=LEF32@22050 -f "${tempTextFile}"`;
   } else {
-    // festival
     command = `text2wave "${tempTextFile}" -o "${wavFile}"`;
   }
 
-  try {
-    await execAsync(command);
-    const absolutePath = path.resolve(wavFile);
-    return `Audio generated successfully!\nFile: ${absolutePath}\nEngine: ${availableTool}\nNote: Audio is a preview of the first 5000 characters of the script.`;
-  } catch (error) {
-    const errMsg = error instanceof Error ? error.message : String(error);
-    return `TTS generation failed: ${errMsg}\n\nScript text has been prepared but audio conversion failed.`;
+  await execAsync(command);
+  return `Audio generated with ${availableTool} (system TTS — robotic voice).\nFile: ${path.resolve(wavFile)}\nFor natural voices, set OPENAI_API_KEY or ELEVENLABS_API_KEY.`;
+}
+
+async function textToSpeech(params: {
+  text: string;
+  output_file?: string;
+  provider?: string;
+  voice?: string;
+}): Promise<string> {
+  const outputFile = params.output_file ?? "podcast_output.mp3";
+  const provider = detectTtsProvider(params.provider);
+
+  if (provider === "openai") {
+    return ttsOpenAI({ text: params.text, output_file: outputFile, voice: params.voice });
+  } else if (provider === "elevenlabs") {
+    return ttsElevenLabs({ text: params.text, output_file: outputFile, voice: params.voice });
+  } else {
+    return ttsSystem({ text: params.text, output_file: outputFile, voice: params.voice });
   }
 }
 
@@ -305,6 +478,7 @@ async function handleTextToSpeech(args: Record<string, unknown>): Promise<string
   return textToSpeech({
     text: args.text as string,
     output_file: args.output_file as string | undefined,
+    provider: args.provider as string | undefined,
     voice: args.voice as string | undefined,
   });
 }
@@ -324,7 +498,9 @@ async function handleCreatePodcast(args: Record<string, unknown>): Promise<strin
     result += "\n\n=== AUDIO GENERATION ===\n";
     const audioResult = await textToSpeech({
       text: script,
-      output_file: (args.output_file as string) ?? "podcast_output.wav",
+      output_file: (args.output_file as string) ?? "podcast_output.mp3",
+      provider: args.tts_provider as string | undefined,
+      voice: args.voice as string | undefined,
     });
     result += audioResult;
   }
