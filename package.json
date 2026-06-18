@@ -1,0 +1,26 @@
+{
+  "name": "podcast-generation-mcp",
+  "version": "1.0.0",
+  "description": "MCP server plugin for AI-powered podcast generation using Claude",
+  "main": "dist/index.js",
+  "bin": {
+    "podcast-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.36.3",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
